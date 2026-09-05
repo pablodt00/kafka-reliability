@@ -150,8 +150,9 @@ a large fixed cost, and for a team with a handful of topics and a modest event
 rate, a library that runs inside a process they already deploy is a genuinely
 different product. That is a real trade-off, not a technical superiority claim,
 and the docs must present it that way. See `02-outbox.md` for the mechanics of
-both and `06-open-questions.md` for whether a CDC-backed relay should be offered
-later.
+both; the relay stays poll-based and the outbox table uses Debezium's expected
+column names, so graduating to Debezium is a connector config rather than a
+migration (`06-decisions.md` D1).
 
 ### Spring / JVM idempotency and DLQ helpers
 

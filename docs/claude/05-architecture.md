@@ -1,8 +1,9 @@
 # 05 — Architecture
 
 > Design context. The code blocks below are **signature sketches**, not an
-> implementation and not a frozen API. No bodies, deliberately. Names are
-> provisional; several are contested in `06-open-questions.md`.
+> implementation. No bodies, deliberately. Every design choice they embody is
+> decided; `06-decisions.md` carries the rationale and the rejected
+> alternatives.
 
 ## The organising constraint
 
@@ -46,8 +47,8 @@ flowchart TB
     end
     subgraph dedup["kafka_reliability.dedup"]
       DS[DedupStore protocol]
-      DS --- PGS[PostgresDedupStore]
-      DS --- RS[RedisDedupStore]
+      DS --- PGS[Postgres / Redis]
+      DS --- RS[SQLite / memory]
       DG[Deduplicator]
     end
     subgraph replay["kafka_reliability.replay"]
@@ -90,25 +91,32 @@ kafka_reliability/
 │   ├── retention.py      # chunked sweep of published rows
 │   └── backends/
 │       ├── asyncpg.py
-│       ├── psycopg.py
-│       └── sqlalchemy.py
+│       ├── psycopg.py       # sync + async
+│       ├── sqlalchemy.py    # Core/ORM, sync + async
+│       └── django.py        # atomic() / on_commit() aware
 ├── dedup/
 │   ├── store.py          # DedupStore protocol, ClaimResult
 │   ├── keys.py           # key-derivation helpers
 │   ├── deduplicator.py   # claim/confirm control flow, replay policy
 │   └── backends/
-│       ├── postgres.py
-│       └── redis.py
+│       ├── postgres.py      # the only store supporting transactional mode
+│       ├── redis.py
+│       ├── sqlite.py        # single-node deployments, container-free tests
+│       └── memory.py        # unit tests only; documented as no guarantee
 ├── replay/
 │   ├── selector.py       # offset / timestamp / predicate selection
 │   ├── runner.py         # dry-run + execute, one code path
 │   ├── dlq.py            # DlqRouter: route a failed message + headers
 │   ├── audit.py          # JSONL audit sink
 │   └── cli.py            # argparse/typer entry point
-└── producers/
-    ├── port.py           # the Producer protocol
-    ├── aiokafka.py
-    └── confluent.py
+├── producers/
+│   ├── port.py           # the Producer protocol
+│   ├── aiokafka.py
+│   ├── confluent.py
+│   └── memory.py         # public test double
+├── metrics.py            # MetricsSink protocol; no-op default
+└── contrib/
+    └── otel.py           # optional OpenTelemetry MetricsSink adapter
 ```
 
 `producers/` is shared by `outbox` and `replay` and is the one place a Kafka
@@ -123,13 +131,14 @@ publisher, a test double) without the library knowing.
 | `core` | stdlib only |
 | `producers.port` | `core` |
 | `producers.aiokafka` | `core`, `producers.port`, `aiokafka` |
-| `outbox.writer` | `core` + the user's DB driver (lazily) — **no Kafka client** |
+| `outbox.writer` | `core` + the one DB driver its subclass targets — **no Kafka client** |
 | `outbox.relay` | `core`, `producers.port`, DB driver |
 | `dedup` | `core` + its chosen backend driver |
 | `replay` | `core`, `producers.port`, a Kafka **consumer** |
 
 Extras: `[outbox-asyncpg]`, `[outbox-psycopg]`, `[outbox-sqlalchemy]`,
-`[dedup-postgres]`, `[dedup-redis]`, `[aiokafka]`, `[confluent]`, `[cli]`.
+`[outbox-django]`, `[dedup-postgres]`, `[dedup-redis]`, `[aiokafka]`,
+`[confluent]`, `[otel]`, `[cli]`.
 Trade-off: many extras is a documentation burden and a support-matrix burden. The
 alternative — a fat install — makes the "use one module" story false, and that
 story is the reason the library exists.
@@ -185,34 +194,56 @@ handed in.
 ## API sketch — outbox
 
 ```python
-# kafka_reliability/outbox/writer.py
-class OutboxWriter:
+# kafka_reliability/outbox/writer.py  — one typed class per backend (D9)
+class BaseOutboxWriter:
+    """Shared row construction, header validation, event-id minting."""
     def __init__(self, *, table: str = "outbox", event_id_header: str = EVENT_ID) -> None: ...
 
+class AsyncpgOutboxWriter(BaseOutboxWriter):
     async def enqueue(
         self,
-        conn: Any,                       # the CALLER's connection/session, in their transaction
+        conn: asyncpg.Connection,        # a CONNECTION in the caller's transaction, never a pool
         *,
         topic: str,
-        value: bytes,
-        key: bytes | None = None,
+        payload: bytes,
+        aggregatetype: str,
+        aggregateid: str,
+        type: str,
         headers: Mapping[str, bytes] | None = None,
-        event_id: str | None = None,     # generated if omitted
-    ) -> str: ...                        # returns the event id
+        event_id: uuid.UUID | None = None,
+    ) -> uuid.UUID: ...
 
-    async def enqueue_many(self, conn: Any, messages: Sequence[OutgoingMessage]) -> list[str]: ...
+    async def enqueue_many(self, conn: asyncpg.Connection,
+                           messages: Sequence[OutboxMessage]) -> list[uuid.UUID]: ...
 
-class SyncOutboxWriter:
-    def enqueue(self, conn: Any, *, topic: str, value: bytes, ...) -> str: ...
+class SqlAlchemyOutboxWriter(BaseOutboxWriter):
+    async def enqueue(self, session: AsyncSession, *, topic: str, ...) -> uuid.UUID: ...
+
+class PsycopgOutboxWriter(BaseOutboxWriter):        # async
+    async def enqueue(self, conn: psycopg.AsyncConnection, *, topic: str, ...) -> uuid.UUID: ...
+
+class SyncPsycopgOutboxWriter(BaseOutboxWriter):
+    def enqueue(self, conn: psycopg.Connection, *, topic: str, ...) -> uuid.UUID: ...
+
+class SyncSqlAlchemyOutboxWriter(BaseOutboxWriter):
+    def enqueue(self, session: Session, *, topic: str, ...) -> uuid.UUID: ...
+
+class DjangoOutboxWriter(BaseOutboxWriter):
+    """Uses the current atomic() block on the named database alias."""
+    def enqueue(self, *, using: str = "default", topic: str, ...) -> uuid.UUID: ...
 ```
 
-`conn: Any` is uncomfortable and intentional: it may be an `asyncpg.Connection`,
-a `psycopg.AsyncConnection`, or a SQLAlchemy `AsyncSession`, and the backend
-adapter dispatches on it. The alternative — a `Connection` protocol — would fit
-none of the three cleanly (SQLAlchemy sessions are not DBAPI connections) and
-would push a wrapper type onto users who already have a session in hand. The
-trade-off is that a wrong argument fails at runtime rather than in a type
-checker, so the error message must be excellent.
+Separate typed classes rather than one `conn: Any` with runtime dispatch. The
+mistake this prevents is specific and severe: **passing a pool where a
+connection was expected** runs the insert in its own transaction, which silently
+breaks the atomicity the entire pattern exists for — and it produces no error at
+all, just a rare lost or phantom event under crash. A type checker rejects it at
+the call site; runtime dispatch catches it only if we remembered to look
+(`06-decisions.md` D9).
+
+`enqueue` returns the event ID because the caller often needs it before the
+transaction commits — to log it, to return it in an API response, or to correlate
+with the dedup header the consumer will key on.
 
 ```python
 # kafka_reliability/outbox/relay.py
@@ -237,8 +268,10 @@ class OutboxRelay:
 
 ```python
 # kafka_reliability/outbox/schema.py
-def outbox_ddl(table: str = "outbox") -> str: ...                    # paste into your migration
-def make_outbox_table(metadata: Any, table: str = "outbox") -> Any: ...  # SQLAlchemy Table
+def outbox_ddl(table: str = "outbox",
+               payload: Literal["bytea", "jsonb"] = "bytea") -> str: ...   # paste into your migration
+def make_outbox_table(metadata: Any, table: str = "outbox") -> Any: ...    # SQLAlchemy Table
+def django_migration(table: str = "outbox") -> str: ...                    # RunSQL body
 
 # kafka_reliability/outbox/retention.py
 async def sweep_published(pool: Any, *, older_than: timedelta, chunk: int = 10_000,
@@ -266,7 +299,12 @@ class DedupStore(Protocol):
 
 `claim`, not `seen`. A boolean `seen()` cannot be implemented race-free, and an
 API that invites the race is the wrong API (`03-idempotent-consumer.md`). The
-`conn` parameter is how a Postgres store joins the handler's transaction; it is
+`conn` stays `Any` here — unlike the outbox writer (D9) — because it is a
+*protocol* method implemented by stores that accept different connection types,
+and because passing the wrong thing degrades the guarantee rather than silently
+voiding it: `supports_transactions` is checked at construction, so a store that
+cannot use `conn` refuses the strong mode outright instead of ignoring the
+argument. The
 `None` for Redis, and `supports_transactions` lets the `Deduplicator` refuse the
 strong mode rather than degrade silently.
 
@@ -383,3 +421,49 @@ Not an implementation detail — it constrains the API:
   docker-compose), never fakes. `SKIP LOCKED` semantics, `ON CONFLICT` behaviour
   under concurrency, and Redis `SET NX EX` atomicity are exactly the things a
   fake gets wrong — and they are the things this library's correctness rests on.
+
+## API sketch — metrics
+
+```python
+# kafka_reliability/metrics.py
+class MetricsSink(Protocol):
+    def counter(self, name: str, value: int = 1, **labels: str) -> None: ...
+    def gauge(self, name: str, value: float, **labels: str) -> None: ...
+    def histogram(self, name: str, value: float, **labels: str) -> None: ...
+
+class NullMetrics:      # the default
+    ...
+
+# kafka_reliability/contrib/otel.py — behind the [otel] extra
+class OtelMetrics:
+    def __init__(self, meter: Any) -> None: ...
+```
+
+A protocol rather than a direct OpenTelemetry dependency: users on Prometheus
+write a ten-line adapter, and the library does not take a dependency that has
+moved under people before (`06-decisions.md` D11, which also fixes the metric
+names). The one rule the implementation must hold to is that **labels are
+bounded** — never the dedup key, message key, partition or offset. Unbounded
+cardinality is how a library takes down a metrics backend, and it is far easier
+to introduce than to notice.
+
+## Supported versions
+
+**Python 3.11+.** `asyncio.TaskGroup` and `ExceptionGroup` matter in the relay,
+which supervises concurrent produces and must not lose a row when one of them
+fails; `Self` tidies the rest. Trade-off: 3.10 users are excluded, and the cost
+of including them is hand-rolled task supervision in the one place where getting
+it wrong loses messages.
+
+**Kafka 3.5+ tested, 4.x recommended.** Nothing in the design requires a
+4.x-only behaviour — established by design review, not against a live 3.5
+cluster, so the CI matrix must actually test the floor rather than assume it.
+What 4.x improves is documented rather than required: KIP-848's incremental
+rebalances shorten the duplicate-delivery window, KIP-890 hardens transactions,
+and 4.2's share groups change the DLQ topology as described in `04-replay-dlq.md`.
+
+**Postgres 12+** for the outbox: `SKIP LOCKED` (9.5), `GENERATED ALWAYS AS
+IDENTITY` (10) and `pg_current_snapshot()` (13, used only by the optional
+cursor guard) set the floor, and 12 is the oldest release anyone should be
+running anyway. The cursor guard degrades gracefully below 13 because the
+default relay uses `status`-column claiming, which does not need it.

@@ -4,10 +4,9 @@
 > component: a Python API plus a CLI that an engineer runs deliberately, usually
 > during or after an incident.
 >
-> **This document assumes classic consumer groups.** Share groups (production-ready
-> in Kafka 4.2, February 2026) change the per-partition ownership model that much
-> of the retry-topology advice below rests on. See `06-open-questions.md` Q8 —
-> that interaction is unevaluated and the advice here may be dated by it.
+> **Default assumption: classic consumer groups.** Share groups (GA in Kafka 4.2)
+> change the model enough to matter, and the *Share groups* section below says
+> exactly what changes and what does not (`06-decisions.md` D8).
 
 ## The problem
 
@@ -66,12 +65,41 @@ multiply topic count and make "where is my message" a genuinely hard question.
 **Decision: the library ships DLQ *routing* (produce a failed message to a
 configured topic with diagnostic headers) and replay. It does not run a retry
 ladder for you.** The topology is documented; automating it means owning consumer
-lifecycles across several topics, which `00-overview.md` puts out of scope. Note
-also that Kafka Streams gained native DLQ support in 4.2 (Feb 2026) and share
-groups went production-ready in the same release — share groups change the
-per-partition ownership assumptions much of this advice rests on, and whether
-they obsolete the retry ladder is genuinely unclear to me. Flagged as
-speculative in `06-open-questions.md`.
+lifecycles across several topics, which `00-overview.md` puts out of scope.
+
+### Share groups change part of this
+
+Verified 2026-09-05: share groups (KIP-932) are GA in Kafka 4.2. The broker
+acquires each record under a time-limited lock (30s by default), accepts
+per-record acknowledge / release / reject, counts delivery attempts, and
+**archives a record once it hits the attempt limit (5 by default)** — poison
+protection in the broker rather than in your topology. Native DLQ routing is not
+in 4.2; that is KIP-1191, targeting 4.4. *(The 4.4 target is a roadmap
+statement, not a shipped fact.)*
+
+What follows for this module:
+
+- **The retry ladder is largely redundant for share-group consumers.** Delivery
+  counting and the archive limit are what the ladder was emulating, done in the
+  broker and done better.
+- **The ladder is still required for ordering-sensitive workloads**, which
+  cannot use share groups at all: share-partition records may be delivered out
+  of order, especially on redelivery. Per-key ordering is exactly what the outbox
+  works to preserve, so an outbox-fed topic with ordering requirements stays on
+  consumer groups. These two features do not compose, and recommending share
+  groups generally would be wrong.
+- **`DlqRouter` is unchanged under both.** It routes a record the handler
+  rejected; whether the caller then commits an offset or acknowledges a record is
+  the caller's business. Under share groups the useful placement is *before* the
+  attempt limit is reached — past it, the record is archived and the application
+  never sees it again.
+- **Replay is unaffected.** It reads a topic by offset or timestamp and produces
+  to another; neither end involves a consumer-group concept.
+
+The trade-off of supporting both: this document now explains two topologies, and
+it will need revisiting when KIP-1191 lands, since native DLQ routing would make
+`DlqRouter` redundant for share-group users. Better to say that now than to be
+quietly superseded.
 
 ### Distinguishing transient from permanent
 
@@ -264,7 +292,10 @@ Two distinct uses, both legitimate:
   dead-lettered.
 - **Not transform payloads.** Replay is republish, not migrate. A payload that
   needs fixing before it can be processed is a data-repair job with different
-  review requirements. *The counter-argument — that a one-field fixup is exactly
-  what an operator needs at 2am — is real; recorded in `06-open-questions.md`.*
+  review requirements. The counter-argument — that a one-field fixup is exactly
+  what an operator needs at 2am — is real, and loses to auditability: once an
+  arbitrary callable sits in the middle, "what did that replay do" is
+  unanswerable without a script that is not in version control
+  (`06-decisions.md` D7).
 - **Not require a UI.** Python API first, CLI on top of it, so replays can be
   scripted, reviewed in a PR, and run from CI.

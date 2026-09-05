@@ -1,7 +1,8 @@
 # 03 — Idempotent consumer
 
-> Design context. Every decision states its trade-off. Open items are in
-> `06-open-questions.md`.
+> Design context. Every decision states its trade-off. Nothing is left open;
+> `06-decisions.md` records the cross-cutting ones with their rejected
+> alternatives.
 
 ## Why this module exists
 
@@ -146,9 +147,11 @@ when a database session is supplied, B otherwise.
 
 ## Storage: Postgres versus Redis
 
-The genuinely open trade-off in this module. Both are supported behind one
-interface; the point is to describe the choice honestly rather than declare a
-winner.
+The sharpest trade-off in this module. Both ship behind one interface, along
+with SQLite (single-node deployments and container-free tests) and an in-memory
+store (unit tests only — it does not survive a restart, so it silently provides
+no guarantee across the one event that most needs one). **Postgres is the
+default** (`06-decisions.md` D5); the reasoning is below.
 
 **Postgres**
 
@@ -254,9 +257,14 @@ that is very hard to retrofit.
 **In-flight work after partition revocation.** When a partition is revoked, work
 for it should stop: finishing it and committing offsets for a partition you no
 longer own is at best wasted and at worst a lost-update race with the new owner.
-The library should expose a revocation-aware cancellation signal. *How far to
-take this — cooperative cancellation of a running handler is intrusive — is
-unresolved; see `06-open-questions.md`.*
+**Decision: the library exposes a revocation signal (an `asyncio.Event` per
+assignment) and does nothing else.** It does not cancel a running handler:
+interrupting a handler mid-side-effect converts a clean duplicate into a
+partial write, which is strictly worse than the wasted work it would save. The
+handler observes the signal at its own safe points, or ignores it and finishes.
+Trade-off: work already in flight on a revoked partition still completes and is
+still wasted; the new owner's claim on the same key is what actually prevents
+the double side effect.
 
 **Partition count changes** rehash keys to different partitions. Any dedup keyed
 on `(topic, partition, offset)` is meaningless across such a change. Another

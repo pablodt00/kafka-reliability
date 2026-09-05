@@ -1,6 +1,7 @@
 # 00 — Overview
 
-> Status: design context, not a specification. Nothing here has been implemented.
+> Status: design context, not a specification. Nothing here has been
+> implemented, and no design decision is left open — see `06-decisions.md`.
 > Research current as of **2026-09-05**. Version-dependent claims are dated where
 > they appear; see `01-prior-art.md` for the sources behind them.
 
@@ -138,9 +139,30 @@ flowchart LR
 The outbox produces at-least-once, so the consumer needs deduplication. Replay
 deliberately re-injects messages, so the consumer needs deduplication *and* the
 replay tool needs a way to say "this is a replay, dedup should/should not
-suppress it" — that interaction is one of the more interesting design problems
-and is discussed in `04-replay-dlq.md` and left partly open in
-`06-open-questions.md`.
+suppress it" — that interaction is resolved by a replay-ID header and a
+`replay_policy` on the dedup layer, described in `04-replay-dlq.md` and
+`03-idempotent-consumer.md`.
+
+## Where it runs
+
+The library aims to be usable in essentially any Python-on-Postgres project
+rather than in one framework's ecosystem. Concretely (full rationale in
+`06-decisions.md` D13):
+
+- **Outbox writers:** asyncpg, psycopg 3 (sync and async), SQLAlchemy Core/ORM
+  (sync and async), Django ORM. Each is a separately typed class, because a
+  wrongly-typed connection silently breaks the atomicity the pattern exists for.
+- **Dedup stores:** Postgres (the only one supporting the strong
+  same-transaction mode), Redis, SQLite, in-memory-for-tests.
+- **Producers:** aiokafka, confluent-kafka, an in-memory double, or any object
+  satisfying a three-method `Producer` protocol — which is how a FastStream
+  publisher works here without the library knowing FastStream exists.
+- **Consumer side:** a context manager plus CI-tested integration recipes for
+  aiokafka, confluent-kafka, FastStream and Celery.
+
+Sync and async are both first-class on the two paths that sit in the caller's
+hot code — the outbox writer and the dedup store — because Django and Celery
+users cannot be told to run an event loop to insert a row.
 
 ## Explicitly out of scope
 
@@ -167,12 +189,14 @@ or docstring that says "exactly once" without qualification is a bug.
 
 **Not CDC.** The library will not read the Postgres WAL, will not manage
 replication slots, and will not attempt to be a Debezium replacement. Polling
-relay only, at least initially. `02-outbox.md` explains what that costs and
-`06-open-questions.md` records the argument for revisiting it.
+relay only. `02-outbox.md` explains what that costs; the mitigation is that the
+outbox table uses Debezium-compatible column names, so a team that outgrows the
+polling relay switches to Debezium with a connector config rather than a data
+migration (`06-decisions.md` D1).
 
 **Not an ORM integration layer.** The outbox needs to enlist in *your*
 transaction. It will accept a connection or session you already have, and it
-will support SQLAlchemy because that is where the users are, but it will not own
+supports asyncpg, psycopg, SQLAlchemy and Django, but it will not own
 your session lifecycle, provide a Django app, or ship Alembic migrations that
 run themselves. It will emit DDL you can paste into your own migration.
 
@@ -186,20 +210,23 @@ SQS, and generalising them is exactly how a small library becomes a leaky
 abstraction. Kafka's partitioning and offset model shape too much of the design
 here to pretend otherwise.
 
-**Not multi-database, at first.** Postgres for the outbox. The storage interface
-for the dedup store is pluggable (Postgres and Redis both, at minimum), because
-that trade-off is genuinely open; the outbox's is not, because `SKIP LOCKED`,
-transactional DDL and `SERIAL`/identity semantics are load-bearing. MySQL support
-is plausible later and is listed in `06-open-questions.md`.
+**Not multi-database for the outbox.** Postgres only, because `SKIP LOCKED`,
+transactional DDL and identity semantics are load-bearing. The *dedup* store is
+pluggable across four backends because that abstraction is narrow enough to hold
+(D5, D13). MySQL for the outbox is declined: the port is not mechanical and the
+audience does not justify it.
 
-**Not observability infrastructure.** The library emits metrics and traces
-through whatever the host application already uses (OpenTelemetry, if anything);
-it does not ship a dashboard, a Prometheus exporter, or a logging framework.
+**Not observability infrastructure.** The library reports through a small
+`MetricsSink` protocol you wire to whatever you run, with an optional
+OpenTelemetry adapter behind an extra (D11). It does not ship a dashboard, a
+Prometheus exporter, or a logging framework.
 
 ## What "done" means for these docs
 
 These documents are the input to an implementation, not a substitute for it.
 They are complete when a competent Python engineer who has never used the outbox
 pattern could read them, understand what each module must guarantee and what it
-must refuse to guarantee, and start writing code — including knowing which
-decisions are still theirs to make (`06-open-questions.md`).
+must refuse to guarantee, and start writing code without having to make a design
+decision along the way. Every decision is made; `06-decisions.md` records each
+one with the trade-off accepted, the alternatives rejected, and the evidence
+that would overturn it.

@@ -1,8 +1,8 @@
 # 02 — Transactional outbox
 
 > Design context. No implementation exists. Every decision below states its
-> trade-off; decisions still genuinely open are cross-referenced to
-> `06-open-questions.md` rather than pretended settled here.
+> trade-off. Nothing is left open; `06-decisions.md` records the cross-cutting
+> decisions with their rejected alternatives.
 
 ## The mechanic
 
@@ -18,7 +18,7 @@ sequenceDiagram
     participant K as Kafka
     App->>PG: BEGIN
     App->>PG: INSERT INTO orders ...
-    App->>PG: INSERT INTO outbox (topic, key, payload)
+    App->>PG: INSERT INTO outbox (topic, aggregateid, payload)
     App->>PG: COMMIT
     Note over App,PG: one atomic unit — both rows or neither
     loop poll
@@ -81,7 +81,7 @@ minimises duplicates and maximises write amplification. **Decision: batch claim,
 per-row or small-chunk mark-sent, batch size configurable, default modest (~100).**
 
 **Two relays run at once.** Inevitable during a rolling deploy, and the common
-naive implementation (`SELECT ... WHERE sent_at IS NULL ORDER BY id LIMIT n`)
+naive implementation (`SELECT ... WHERE sent_at IS NULL ORDER BY seq LIMIT n`)
 publishes everything twice *and* interleaves the two publishers, destroying
 ordering. Must be prevented structurally, not by convention — see *Concurrency
 and ordering* below.
@@ -110,7 +110,7 @@ relay after their transaction commits, which is correct and is in fact the
 property that makes the pattern work. But it means a slow transaction delays
 those events, and — more subtly — **a row inserted earlier can become visible
 later than a row inserted afterwards**, because sequence values are allocated
-before commit. This breaks any relay that tracks a high-water mark by `id` and
+before commit. This breaks any relay that tracks a high-water mark by `seq` and
 never revisits lower ids: it will skip rows that committed late. See *Ordering*.
 
 **Clock skew.** Any relay logic that orders or filters by `created_at` on
@@ -131,7 +131,7 @@ Two mechanisms, with different characters:
 ```sql
 SELECT * FROM outbox
  WHERE status = 'pending'
- ORDER BY id
+ ORDER BY seq
  LIMIT :batch
  FOR UPDATE SKIP LOCKED;
 ```
@@ -140,26 +140,27 @@ Each worker locks its batch; concurrent workers skip locked rows and take the
 next ones. This is the standard Postgres queue idiom and it scales horizontally
 cleanly.
 
-**It does not preserve per-key ordering.** Worker A takes rows 1–100 (containing
-key `order-7` at row 5), worker B takes 101–200 (containing `order-7` at row
-150), and B may publish first. For a topic where per-key order matters — and for
+**It does not preserve per-key ordering.** Worker A takes `seq` 1–100 (containing
+key `order-7` at 5), worker B takes 101–200 (containing `order-7` at 150), and B
+may publish first. For a topic where per-key order matters — and for
 event-sourced aggregates it almost always does — this is a correctness bug that
 appears only under concurrency and load, which is to say in production.
 
-The fix is to shard the claim by key rather than by row: `WHERE hashtext(key) %
-:shards = :shard`, or claim with `SKIP LOCKED` but take *all* pending rows for
-each claimed key. Both work; both add complexity.
+The fix is to shard the claim by key rather than by row: `WHERE
+hashtext(aggregateid) % :shards = :shard`, or claim with `SKIP LOCKED` but take
+*all* pending rows for each claimed key. Both work; both add complexity.
 
 ### Single-relay with a sequence cursor
 
 One relay process (elected via a Postgres advisory lock, so a second instance
-starting during a deploy simply waits) walks rows in `id` order and tracks a
+starting during a deploy simply waits) walks rows in `seq` order and tracks a
 cursor. Ordering is trivially correct. Throughput is one process.
 
 The subtlety noted above bites here: **you cannot advance the cursor past ids
 whose transactions have not yet committed.** Sequence values are allocated at
-`INSERT`, commit order is not insertion order, and so id 105 may become visible
-before id 104. A cursor that jumps to 105 loses 104 permanently. Guards:
+`INSERT`, commit order is not insertion order, and so `seq` 105 may become
+visible before `seq` 104. A cursor that jumps to 105 loses 104 permanently.
+Guards:
 
 - Ignore rows newer than some safety margin (fragile; a long transaction beats
   any margin you pick).
@@ -179,7 +180,9 @@ for ordering that is correct without the user having to reason about it. Users
 who need more throughput opt into sharding and accept that ordering holds
 per-key only within a shard — which is the same guarantee, provided the shard
 function is on the key. This is worth stating as a rule: **shard by key hash,
-never by row id.**
+never by row id** — and the API enforces it rather than documenting it, since
+sharding by `seq` is the trap and there is no reason to leave it reachable
+(`06-decisions.md` D2).
 
 ## Polling versus CDC
 
@@ -195,7 +198,7 @@ The two ways to get rows out of the table:
 | Failure mode | backlog in a table | **a stalled slot pins WAL and can fill the disk** |
 | Delete strategy | relay marks/deletes rows | rows can be deleted immediately (see below) |
 
-**Decision: polling only, for v1.** Reasoning: the entire adoption case for this
+**Decision: polling only.** Reasoning: the entire adoption case for this
 library over Debezium is "you do not have to run anything else"
 (`01-prior-art.md`). Shipping a CDC relay means either depending on a Connect
 cluster (in which case use Debezium's own SMT, which is better) or writing a
@@ -205,6 +208,12 @@ slot filling the primary's disk is a far worse incident than a polling delay.
 The trade-off, stated plainly: users pay poll-interval latency and a small
 constant query load on the primary, and the implementation must handle
 late-commit ordering itself.
+
+**And the escape hatch is designed in rather than deferred:** the table below
+uses Debezium's expected column names, so a team that outgrows the polling relay
+stops it and points a Debezium connector at the same table — a connector config,
+not a migration (`06-decisions.md` D1). A library that makes its own replacement
+straightforward is easier to adopt, because adopting it is no longer a bet.
 
 One CDC trick worth borrowing conceptually: with WAL-based capture, the outbox
 row can be **inserted and deleted in the same transaction** — the WAL still
@@ -218,24 +227,58 @@ Two shapes, and the choice is not obvious.
 
 ### Option A — one shared `outbox` table
 
+Column names follow Debezium's Outbox Event Router defaults, which (verified
+2026-09-05) are `id`, `aggregatetype`, `aggregateid`, `type` and `payload`, with
+routing by `aggregatetype` to `outbox.event.${routedByValue}` and the record
+keyed by `aggregateid`. Everything else is ours and Debezium ignores it.
+
 ```sql
 CREATE TABLE outbox (
-    id           BIGSERIAL PRIMARY KEY,
-    topic        TEXT        NOT NULL,
-    key          BYTEA,
-    payload      BYTEA       NOT NULL,
-    headers      JSONB       NOT NULL DEFAULT '{}',
-    status       TEXT        NOT NULL DEFAULT 'pending',
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    published_at TIMESTAMPTZ,
-    attempts     INT         NOT NULL DEFAULT 0,
-    last_error   TEXT
+    -- the five Debezium EventRouter reads
+    id            UUID        PRIMARY KEY,              -- also the dedup event id
+    aggregatetype TEXT        NOT NULL,                 -- e.g. 'order'
+    aggregateid   TEXT        NOT NULL,                 -- becomes the Kafka key
+    type          TEXT        NOT NULL,                 -- e.g. 'OrderCreated'
+    payload       BYTEA       NOT NULL,                 -- or JSONB, see below
+
+    -- ours: the relay's bookkeeping, invisible to Debezium
+    seq           BIGGENERATED ALWAYS AS IDENTITY,      -- ordering, not identity
+    topic         TEXT        NOT NULL,
+    headers       JSONB       NOT NULL DEFAULT '{}',
+    status        TEXT        NOT NULL DEFAULT 'pending'
+                  CHECK (status IN ('pending','published','failed')),
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    published_at  TIMESTAMPTZ,
+    attempts      INT         NOT NULL DEFAULT 0,
+    last_error    TEXT
 );
-CREATE INDEX outbox_pending_idx ON outbox (id) WHERE status = 'pending';
+CREATE INDEX outbox_pending_idx ON outbox (seq) WHERE status = 'pending';
 ```
 
-The partial index is the important part: it stays small regardless of table
-size, so claim queries do not degrade as history accumulates.
+*(`BIGGENERATED ALWAYS AS IDENTITY` above is shorthand for
+`BIGINT GENERATED ALWAYS AS IDENTITY`; the emitted DDL spells it correctly.)*
+
+Two things are doing work here. The **partial index** stays small regardless of
+table size, so claim queries do not degrade as history accumulates. And **`id` is
+a UUID while `seq` is the monotonic ordering column** — a split forced by
+Debezium compatibility, since EventRouter wants `id` to be the event's identity,
+and it turns out to be the better design anyway: the event ID is generated by the
+application (so it can be returned from `enqueue()` and carried as the dedup
+header before the transaction commits), while ordering stays a database-assigned
+sequence that no application clock can skew.
+
+**Trade-off of the compatibility:** `topic` is redundant with what Debezium would
+derive from `aggregatetype`, and `aggregateid` is usually the same value as the
+Kafka key. Carrying both is duplicated storage and one more consistency
+invariant. Accepted because the explicit `topic` column is what keeps our relay
+simple and lets one table feed arbitrarily-named topics no route pattern would
+produce.
+
+**`payload` is the sharp edge.** `BYTEA` is the default and the right choice for
+Avro or Protobuf; Debezium's default expects JSON. Both DDL variants ship
+(`outbox_ddl(payload="bytea" | "jsonb")`), and the cost is stated rather than
+hidden: choose `bytea` and a later move to Debezium needs either a column
+conversion or a `BinaryHandlingMode` setting.
 
 ### Option B — per-aggregate tables
 
@@ -258,14 +301,18 @@ Column choices worth defending:
   to query payloads in SQL, which is genuinely useful when debugging. A
   `payload_json` generated column is available to users who want both and accept
   the storage.
-- **`key BYTEA` nullable.** It is the Kafka partition key; null means
-  round-robin, which is the correct behaviour and also the signal that this row
-  has no ordering requirement.
-- **`headers JSONB`.** Kafka headers are `bytes -> bytes`; JSONB imposes text
-  keys and values. Accepted deliberately: it makes tracing metadata (`traceparent`,
-  event type, schema id) readable in SQL, and binary header values are rare. Users
-  needing binary headers can base64. *This one is arguable; see
-  `06-open-questions.md`.*
+- **`aggregateid` is the Kafka key**, stored as text rather than `BYTEA` because
+  Debezium expects text there. Trade-off: a binary partition key must be encoded
+  by the caller. Binary keys are rare enough that compatibility wins; an empty
+  string means "no key", i.e. round-robin partitioning and no ordering
+  requirement.
+- **`headers JSONB` with text values, validated at `enqueue()`.** Kafka headers
+  are `bytes -> bytes`; JSONB imposes text. Accepted deliberately, because it
+  makes tracing metadata (`traceparent`, event type, schema id) readable in SQL,
+  and that query is exactly what you want during an incident. Binary values must
+  be base64'd by the caller — and the check happens at write time, inside the
+  caller's transaction, so the error lands at the call site that caused it rather
+  than in a background relay minutes later (`06-decisions.md` D3).
 - **`status TEXT` over a boolean or a nullable `published_at`.** Needs at least
   `pending` / `published` / `failed`; a boolean cannot express `failed`. Trade-off
   is a wider column and the need for a `CHECK` constraint.
@@ -285,7 +332,7 @@ the resulting dead tuples make autovacuum a permanent background cost.
 
 **Mark published, delete later in batches.** Keeps a short audit window,
 amortises vacuum pressure, needs a second background job. Deletes must be
-chunked (`DELETE ... WHERE id IN (SELECT id ... LIMIT 10000)`) because a single
+chunked (`DELETE ... WHERE seq IN (SELECT seq ... LIMIT 10000)`) because a single
 unbounded `DELETE` on a large table takes a long lock and generates enormous WAL.
 
 **Partition by time, drop old partitions.** `DROP TABLE` on a partition is
