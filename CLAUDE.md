@@ -57,7 +57,9 @@ Full rationale: `docs/claude/05-architecture.md`.
 - Fast unit suite: `pytest`
 - Integration suite: not available yet — tracked in issue #61 (container
   harness); will be `pytest -m integration` once real integration tests exist.
-- Lint / format / typecheck: not configured yet — tracked in issue #14.
+- Lint: `ruff check .`
+- Format check: `ruff format --check .` (apply fixes locally with `ruff format .`)
+- Type check: `mypy src`
 - Container harness (Kafka/Postgres/Redis): not available yet — tracked in
   issue #61.
 
