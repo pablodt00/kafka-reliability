@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kafka-reliability"
+version = "0.1.0"
+description = "A framework-agnostic library for the transactional outbox, idempotent consumer, and DLQ replay patterns on Kafka."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "pablodt00", email = "pablo.13.d.t@gmail.com" },
+]
+keywords = ["kafka", "outbox", "idempotent-consumer", "dead-letter-queue", "reliability"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+]
+
+[project.optional-dependencies]
+outbox-asyncpg = ["asyncpg"]
+outbox-psycopg = ["psycopg[binary]"]
+outbox-sqlalchemy = ["sqlalchemy"]
+outbox-django = ["django"]
+dedup-postgres = ["asyncpg"]
+dedup-redis = ["redis"]
+aiokafka = ["aiokafka"]
+confluent = ["confluent-kafka"]
+otel = ["opentelemetry-api", "opentelemetry-sdk"]
+cli = ["click"]
+# Tooling, not a backend — installed by the Claude Code SessionStart hook
+# (.claude/hooks/install-deps.sh) and by contributors running the fast suite.
+dev = ["pytest"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kafka_reliability"]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: requires Postgres/Redis/Kafka containers (excluded by default)",
+]
+addopts = "-m 'not integration'"
