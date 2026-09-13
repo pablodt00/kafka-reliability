@@ -37,13 +37,50 @@ otel = ["opentelemetry-api", "opentelemetry-sdk"]
 cli = ["click"]
 # Tooling, not a backend — installed by the Claude Code SessionStart hook
 # (.claude/hooks/install-deps.sh) and by contributors running the fast suite.
-dev = ["pytest"]
+dev = ["pytest", "pytest-asyncio", "ruff", "mypy"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/kafka_reliability"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src"]
+extend-exclude = ["docs"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["kafka_reliability"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.11"
+mypy_path = "src"
+strict = true
+files = ["src/kafka_reliability"]
+
+[[tool.mypy.overrides]]
+module = [
+    "asyncpg.*",
+    "psycopg.*",
+    "sqlalchemy.*",
+    "django.*",
+    "redis.*",
+    "aiokafka.*",
+    "confluent_kafka.*",
+    "opentelemetry.*",
+    "click.*",
+]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 markers = [
     "integration: requires Postgres/Redis/Kafka containers (excluded by default)",
 ]
 addopts = "-m 'not integration'"
+asyncio_mode = "auto"

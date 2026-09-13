@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Ad hoc check of kafka_reliability's module-independence rules
 (docs/claude/05-architecture.md, "The organising constraint")."""
+
 import ast
 import sys
 from pathlib import Path
