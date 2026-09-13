@@ -5,15 +5,25 @@ description: Verify kafka-reliability's module-independence rules haven't been b
 
 # Check module boundaries
 
-kafka-reliability's entire adoption story rests on three rules from
+kafka-reliability's entire adoption story rests on four rules from
 `docs/claude/05-architecture.md` ("The organising constraint"): outbox, dedup
-and replay never import each other; core is stdlib-only; and the outbox
-write path never imports a Kafka client. These aren't enforced by packaging
-(D10) — only by convention and, eventually, CI (issue #15). Until #15 lands
-as a real pytest suite, this skill is the fast way to check the same thing
-by hand, in seconds, without running the full suite.
+and replay never import each other; core is stdlib-only; the outbox write
+path never imports a Kafka client; and a backend without its extra installed
+raises a clear error naming that extra. These are enforced by
+`tests/test_module_boundaries.py` in CI (issue #15, mitigating D10's
+packaging trade-off). This skill's script mirrors the first three of those
+checks for a faster, dependency-free spot-check — e.g. mid-edit, before
+committing — without invoking pytest. It does not check the fourth rule,
+which needs `sys.modules` patching machinery that only makes sense inside
+the pytest suite.
 
 ## Run the check
+
+Authoritative check (all four rules, run in CI):
+
+    pytest tests/test_module_boundaries.py
+
+Fast manual check (rules 1–3 only, no pytest needed):
 
     python .claude/skills/check-module-boundaries/scripts/check_boundaries.py
 

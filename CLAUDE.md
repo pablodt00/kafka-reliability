@@ -50,6 +50,13 @@ Full rationale: `docs/claude/05-architecture.md`.
   `producers/`, run the `check-module-boundaries` skill
   (`.claude/skills/check-module-boundaries`) to verify none of the above broke.
 
+## Git workflow
+Never run `git commit` or `git push` (or open/update a PR) unless the user
+explicitly asks for that specific action in that message. Implementing a
+task, including one planned and approved via plan mode, means making the
+code changes and leaving them uncommitted in the working tree — commit and
+push are separate, later steps the user asks for on their own.
+
 ## Commands
 - Dev install: `pip install -e ".[dev]"` (inside a venv — the SessionStart
   hook does this automatically for a Claude Code web session; see
