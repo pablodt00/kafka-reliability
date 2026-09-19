@@ -37,7 +37,18 @@ otel = ["opentelemetry-api", "opentelemetry-sdk"]
 cli = ["click"]
 # Tooling, not a backend — installed by the Claude Code SessionStart hook
 # (.claude/hooks/install-deps.sh) and by contributors running the fast suite.
-dev = ["pytest", "pytest-asyncio", "ruff", "mypy"]
+# The outbox drivers are here so the writer unit tests run instead of skipping;
+# they are test-time only, never a runtime dependency of any module.
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "ruff",
+    "mypy",
+    "asyncpg",
+    "psycopg[binary]",
+    "sqlalchemy",
+    "django",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/kafka_reliability"]

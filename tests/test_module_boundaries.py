@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import importlib
+import subprocess
 import sys
 from pathlib import Path
 
@@ -66,6 +67,24 @@ def test_outbox_writer_import_does_not_pull_in_kafka_client():
 
     leaked = [m for m in ("aiokafka", "confluent_kafka") if m in sys.modules]
     assert not leaked, f"Kafka client(s) leaked into sys.modules via outbox.writer: {leaked}"
+
+
+def test_no_kafka_client_after_importing_every_outbox_write_path_module():
+    # A fresh interpreter: the in-process check above is polluted by other tests.
+    code = (
+        "import sys\n"
+        "import kafka_reliability.outbox, kafka_reliability.outbox.schema, "
+        "kafka_reliability.outbox.writer\n"
+        "for m in ('asyncpg', 'psycopg', 'sqlalchemy', 'django'):\n"
+        "    try:\n"
+        "        __import__(f'kafka_reliability.outbox.backends.{m}')\n"
+        "    except ImportError:\n"
+        "        pass\n"
+        "leaked = [m for m in ('aiokafka', 'confluent_kafka', 'kafka') if m in sys.modules]\n"
+        "sys.exit(f'leaked: {leaked}' if leaked else 0)\n"
+    )
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr or result.stdout
 
 
 def test_missing_extra_raises_clear_error(monkeypatch):

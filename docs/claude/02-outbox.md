@@ -1,6 +1,8 @@
 # 02 — Transactional outbox
 
-> Design context. No implementation exists. Every decision below states its
+> Design context. The schema and write path are implemented (`outbox/schema.py`,
+> `outbox/writer.py`, `outbox/backends/`); the relay and retention are not yet.
+> Every decision below states its
 > trade-off. Nothing is left open; `06-decisions.md` records the cross-cutting
 > decisions with their rejected alternatives.
 
@@ -321,6 +323,29 @@ Column choices worth defending:
 - **No `partition` column.** Letting the producer pick the partition from the key
   is correct; pinning partitions in the outbox freezes a topic's partition count
   into historical data.
+
+### Write path as built
+
+- `enqueue()` returns the event ID, which is the row's `id`. **The writer does
+  not stamp `x-event-id`**; the relay derives that header from `id` when it
+  publishes, so the value is stored once.
+- `aggregateid=""` means "no key": round-robin partitioning, no ordering
+  requirement.
+- Header values are validated (UTF-8 decodable, no NUL) before any SQL runs, so
+  a `HeaderValidationError` leaves the caller's transaction usable. Batches
+  (`enqueue_many`) validate every message before inserting any.
+- The table name is interpolated into SQL, so it must be a plain identifier,
+  optionally schema-qualified; anything else raises `ConfigurationError`.
+- With `payload="jsonb"` the writer decodes the payload as UTF-8 and casts it
+  to `jsonb`; the writer's `payload` argument must match the DDL used.
+- `payload_json=True` (bytea only) adds a generated `payload_json` column
+  through an `IMMUTABLE` wrapper function, because `convert_from()` is only
+  `STABLE` and generated columns reject that. Inserts whose payload is not
+  UTF-8 JSON then fail.
+- Django: `DjangoOutboxWriter.enqueue()` raises `ConfigurationError` outside
+  `transaction.atomic()`. Do not use `on_commit()` to publish instead: the
+  outbox row exists so the publish survives the commit, and `on_commit` loses
+  the event if the process dies before the callback runs.
 
 ## Cleanup
 
