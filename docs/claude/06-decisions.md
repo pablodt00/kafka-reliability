@@ -415,3 +415,45 @@ semantics are load-bearing), CDC relay (D1 makes graduating to Debezium a config
 change instead), schema registry and serialization (payloads are `bytes`), and
 consumer-loop ownership (D4). `00-overview.md` holds the full non-goals list;
 these are the ones someone will specifically ask for.
+
+---
+
+## D14 — Producer semantics: ack-on-return, `ProducerError`, poll-thread bridge for confluent-kafka
+
+**Decided:**
+
+- **`send` returns only after the broker has acknowledged the message**, and
+  raises `ProducerError` (a `core` exception, original chained as `__cause__`)
+  if it cannot. The outbox relay marks a row sent as soon as `send` returns, so
+  a `send` that returned early would turn a crash into silent loss.
+  `flush(timeout)` waits for anything in flight and raises `ProducerError` if
+  messages remain when it expires. The protocol has **two** methods, `send` and
+  `flush`.
+- **Adapters raise `ProducerError`, not their client's exceptions**, so callers
+  never import `aiokafka` or `confluent_kafka` to catch a failure. It is a new
+  class rather than a reuse of `RelayError` because replay and the in-memory
+  producer raise it too, and "relay" would mislead them.
+- **`acks=all` and idempotence are enforced in the convenience factories**
+  (`create_producer`): restating them is fine, weakening either raises
+  `ConfigurationError`. A client the caller builds and hands in is theirs; the
+  library cannot see its config and documents the requirement instead
+  (`02-outbox.md`).
+- **The confluent-kafka adapter drives `poll()` from a background thread** and
+  resolves a per-message future through `loop.call_soon_threadsafe`.
+
+**Trade-off accepted:** awaiting the ack per `send` means a caller that wants
+throughput must issue sends concurrently (`asyncio.gather`) rather than rely on
+fire-and-forget; both adapters pipeline concurrent sends. The confluent adapter
+owns a thread that runs while it is open, so `close()` must flush *before*
+stopping the poller. The factories refuse weaker settings even for users who
+have a reason for them; they can hand in their own client.
+
+**Rejected:** fire-and-forget `send` plus a callback (the relay would need its
+own ack bookkeeping and the protocol would grow); the confluent-kafka 2.x
+`AIOProducer` (pins a minimum version for a newer API and was not verifiable
+against a real broker when this was decided); reusing `RelayError`.
+
+**What would reverse it:** real-broker evidence (issue #61) that the poll thread
+is a throughput bottleneck or misbehaves on shutdown would justify moving to
+`AIOProducer`; a user need for batching semantics the protocol cannot express
+would justify a `send_batch` — not silently widening `send`.

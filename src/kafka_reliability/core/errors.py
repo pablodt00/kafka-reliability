@@ -20,6 +20,15 @@ class StoreUnavailableError(KafkaReliabilityError):
     """A dedup or outbox store could not be reached."""
 
 
+class ProducerError(KafkaReliabilityError):
+    """A producer could not deliver a message, or could not flush.
+
+    Producer adapters raise this in place of their client's own exceptions, so
+    callers never import `aiokafka` or `confluent_kafka` to catch a failure.
+    The original exception is chained as `__cause__`.
+    """
+
+
 class RelayError(KafkaReliabilityError):
     """The outbox relay failed to produce a message to Kafka."""
 

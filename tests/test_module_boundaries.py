@@ -76,3 +76,39 @@ def test_missing_extra_raises_clear_error(monkeypatch):
         importlib.import_module("kafka_reliability.outbox.backends.asyncpg")
 
     sys.modules.pop("kafka_reliability.outbox.backends.asyncpg", None)
+
+
+def test_producer_port_and_memory_import_only_stdlib_and_core():
+    stdlib = sys.stdlib_module_names
+    violations: list[str] = []
+    for name in ("port.py", "memory.py"):
+        path = PKG_ROOT / "producers" / name
+        for imp in _imports_of(path):
+            root = imp.split(".")[0]
+            allowed = imp == "kafka_reliability.core" or imp.startswith("kafka_reliability.core.")
+            if root not in stdlib and not allowed:
+                violations.append(f"{path.relative_to(PKG_ROOT.parent)}: imports {imp}")
+    assert not violations, "producers.port/memory import beyond stdlib + core:\n" + "\n".join(
+        violations
+    )
+
+
+def test_importing_producers_package_does_not_pull_in_a_kafka_client():
+    for mod in ("aiokafka", "confluent_kafka", "kafka_reliability.producers"):
+        sys.modules.pop(mod, None)
+
+    importlib.import_module("kafka_reliability.producers")
+
+    leaked = [m for m in ("aiokafka", "confluent_kafka") if m in sys.modules]
+    assert not leaked, f"Kafka client(s) leaked into sys.modules via producers: {leaked}"
+
+
+def test_outbox_and_replay_depend_on_the_protocol_not_a_concrete_adapter():
+    adapters = ("kafka_reliability.producers.aiokafka", "kafka_reliability.producers.confluent")
+    violations: list[str] = []
+    for pkg in ("outbox", "replay"):
+        for path in (PKG_ROOT / pkg).rglob("*.py"):
+            for imp in _imports_of(path):
+                if imp in adapters:
+                    violations.append(f"{path.relative_to(PKG_ROOT.parent)}: imports {imp}")
+    assert not violations, "Concrete producer adapter imported:\n" + "\n".join(violations)
