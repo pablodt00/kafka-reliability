@@ -73,7 +73,9 @@ header conventions defined in `core`:
   policy reads it. Same property: an unused header is inert.
 
 Header names are constants in `core` so all three agree, but no module requires
-another to be installed for its own headers to work.
+another to be installed for its own headers to work. The concrete names are
+`x-event-id`, `x-replay-id`, `x-replay-at`, and the `x-dlq-*` family (see
+`core/headers.py`).
 
 ## Package layout
 
