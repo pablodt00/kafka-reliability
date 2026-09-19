@@ -9,7 +9,22 @@ class KafkaReliabilityError(Exception):
     """Base of every exception this library raises."""
 
 
-class MissingExtraError(KafkaReliabilityError, ImportError):
+class ConfigurationError(KafkaReliabilityError):
+    """The library was set up in a way that cannot work.
+
+    For example `mode="transactional"` against a store that cannot honour it.
+    """
+
+
+class StoreUnavailableError(KafkaReliabilityError):
+    """A dedup or outbox store could not be reached."""
+
+
+class RelayError(KafkaReliabilityError):
+    """The outbox relay failed to produce a message to Kafka."""
+
+
+class MissingExtraError(ConfigurationError, ImportError):
     """A backend's third-party driver is not installed.
 
     Raised in place of a bare ImportError/ModuleNotFoundError so the message
