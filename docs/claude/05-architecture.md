@@ -449,6 +449,10 @@ bounded** — never the dedup key, message key, partition or offset. Unbounded
 cardinality is how a library takes down a metrics backend, and it is far easier
 to introduce than to notice.
 
+`metrics.py` holds the name constants and `METRIC_SPECS` (kind and permitted
+labels per metric) as the code mirror of D11's table; emission tests check
+call sites against it.
+
 ## Supported versions
 
 **Python 3.11+.** `asyncio.TaskGroup` and `ExceptionGroup` matter in the relay,
