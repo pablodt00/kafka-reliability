@@ -29,6 +29,16 @@ class ProducerError(KafkaReliabilityError):
     """
 
 
+class HeaderValidationError(KafkaReliabilityError, ValueError):
+    """An outbox header cannot be stored.
+
+    Raised by `enqueue()` inside the caller's transaction, so the error lands
+    at the call site that caused it rather than in a relay minutes later
+    (06-decisions.md D3). Binary header values must be base64-encoded by the
+    caller.
+    """
+
+
 class RelayError(KafkaReliabilityError):
     """The outbox relay failed to produce a message to Kafka."""
 

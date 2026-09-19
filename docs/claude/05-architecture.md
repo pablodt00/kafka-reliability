@@ -200,7 +200,13 @@ handed in.
 # kafka_reliability/outbox/writer.py  — one typed class per backend (D9)
 class BaseOutboxWriter:
     """Shared row construction, header validation, event-id minting."""
-    def __init__(self, *, table: str = "outbox", event_id_header: str = EVENT_ID) -> None: ...
+    def __init__(self, *, table: str = "outbox", payload: Literal["bytea", "jsonb"] = "bytea") -> None: ...
+    # SqlAlchemy* writers take `table: sqlalchemy.Table` (from make_outbox_table) instead.
+
+@dataclass(frozen=True, slots=True)
+class OutboxMessage:                     # element type of enqueue_many
+    topic: str; payload: bytes; aggregatetype: str; aggregateid: str; type: str
+    headers: Mapping[str, bytes] = ...; event_id: uuid.UUID | None = None
 
 class AsyncpgOutboxWriter(BaseOutboxWriter):
     async def enqueue(
@@ -232,7 +238,8 @@ class SyncSqlAlchemyOutboxWriter(BaseOutboxWriter):
     def enqueue(self, session: Session, *, topic: str, ...) -> uuid.UUID: ...
 
 class DjangoOutboxWriter(BaseOutboxWriter):
-    """Uses the current atomic() block on the named database alias."""
+    """Uses the current atomic() block on the named database alias; raises
+    ConfigurationError outside one."""
     def enqueue(self, *, using: str = "default", topic: str, ...) -> uuid.UUID: ...
 ```
 

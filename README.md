@@ -17,7 +17,8 @@ library never promises "exactly once".
 |---|---|
 | `core` (messages, headers, clock, errors) and `metrics` | implemented |
 | `producers` (protocol, in-memory, aiokafka, confluent-kafka) | implemented |
-| `outbox`, `dedup`, `replay` | planned |
+| `outbox` schema and write path (DDL, `BaseOutboxWriter`, asyncpg / psycopg / SQLAlchemy / Django writers) | implemented |
+| `outbox` relay and retention, `dedup`, `replay` | planned |
 
 The design record lives in [`docs/claude/`](docs/claude/); every decision, with
 its trade-offs, is in [`06-decisions.md`](docs/claude/06-decisions.md).
@@ -88,6 +89,35 @@ producer.assert_sent(topic="orders", key=b"42")
 producer.fail_next()  # next send raises ProducerError
 ```
 
+## Outbox: enqueue inside your own transaction
+
+The writer never opens a connection and never commits: you hand it the
+connection or session your transaction already uses, so the event and your
+business write commit or roll back together. Paste `outbox_ddl()` into your own
+migration (the library never runs migrations).
+
+```python
+from kafka_reliability.outbox.backends.asyncpg import AsyncpgOutboxWriter
+from kafka_reliability.outbox.schema import outbox_ddl
+
+print(outbox_ddl())  # or payload="jsonb"; see 02-outbox.md
+writer = AsyncpgOutboxWriter()
+
+async with conn.transaction():  # conn: asyncpg.Connection, never a pool
+    await conn.execute("INSERT INTO orders ...")
+    event_id = await writer.enqueue(
+        conn,
+        topic="orders",
+        payload=b"...",
+        aggregatetype="order",
+        aggregateid="o-1",
+        type="OrderCreated",
+    )
+```
+
+Delivery is at-least-once: consumers of an outbox-fed topic must deduplicate
+(effectively-once processing).
+
 ## Development
 
 ```
@@ -97,4 +127,13 @@ ruff check . && ruff format --check .
 mypy src
 ```
 
-The integration suite (real Kafka/Postgres/Redis) is tracked in issue #61.
+The outbox write-path conformance suite needs a real Postgres. Point it at any
+database you can create tables in (it uses the tables `outbox`, `outbox_j` and
+`biz`, and drops them afterwards):
+
+```
+KAFKA_RELIABILITY_TEST_PG_DSN=postgresql://user:pw@host:5432/db pytest -m integration
+```
+
+Without the variable those tests are skipped. The container harness (Kafka,
+Redis, and a managed Postgres) is tracked in issue #61.

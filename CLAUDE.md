@@ -65,8 +65,10 @@ push are separate, later steps the user asks for on their own.
   hook does this automatically for a Claude Code web session; see
   `.claude/hooks/install-deps.sh`).
 - Fast unit suite: `pytest`
-- Integration suite: not available yet — tracked in issue #61 (container
-  harness); will be `pytest -m integration` once real integration tests exist.
+- Integration suite: `pytest -m integration`. Today that is the outbox
+  write-path conformance suite (`tests/outbox/test_conformance.py`), which needs
+  a Postgres named by `KAFKA_RELIABILITY_TEST_PG_DSN` and skips without it. The
+  container harness that provides one is tracked in issue #61.
 - Lint: `ruff check .`
 - Format check: `ruff format --check .` (apply fixes locally with `ruff format .`)
 - Type check: `mypy src`
