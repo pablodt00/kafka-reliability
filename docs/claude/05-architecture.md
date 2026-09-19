@@ -189,8 +189,9 @@ class Producer(Protocol):
     async def flush(self, timeout: float | None = None) -> None: ...
 ```
 
-Deliberately three methods, no partitioner control, no serializers, no config
-passthrough. Anything richer belongs to the client the user configured and
+`send` returns only once the broker has acknowledged the message, and failures
+surface as `ProducerError` (D14). Deliberately two methods, no partitioner
+control, no serializers, no config passthrough. Anything richer belongs to the client the user configured and
 handed in.
 
 ## API sketch — outbox

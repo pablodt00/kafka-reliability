@@ -49,6 +49,9 @@ Full rationale: `docs/claude/05-architecture.md`.
 - Before finishing work that touches `outbox/`, `dedup/`, `replay/`, or
   `producers/`, run the `check-module-boundaries` skill
   (`.claude/skills/check-module-boundaries`) to verify none of the above broke.
+- Before finishing any change that alters public API, extras, module layout, or
+  a design decision, run the `sync-docs` skill so `README.md` and `docs/claude/`
+  match the code. To plan a GitHub issue/epic from a link, use `plan-issue`.
 
 ## Git workflow
 Never run `git commit` or `git push` (or open/update a PR) unless the user

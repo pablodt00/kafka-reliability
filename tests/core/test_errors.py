@@ -8,6 +8,7 @@ from kafka_reliability.core.errors import (
     ConfigurationError,
     KafkaReliabilityError,
     MissingExtraError,
+    ProducerError,
     RelayError,
     StoreUnavailableError,
     require_extra,
@@ -16,7 +17,7 @@ from kafka_reliability.core.errors import (
 
 @pytest.mark.parametrize(
     "error",
-    [ConfigurationError, StoreUnavailableError, RelayError, MissingExtraError],
+    [ConfigurationError, StoreUnavailableError, RelayError, MissingExtraError, ProducerError],
 )
 def test_every_error_derives_from_the_base(error):
     assert issubclass(error, KafkaReliabilityError)
