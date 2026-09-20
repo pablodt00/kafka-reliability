@@ -35,6 +35,13 @@ def test_bytea_ddl_has_every_column_and_the_partial_index():
     assert "CREATE INDEX outbox_pending_idx ON outbox (seq) WHERE status = 'pending';" in ddl
 
 
+def test_ddl_has_a_partial_index_on_failed_rows_for_the_relay_block_check():
+    assert (
+        "CREATE INDEX outbox_failed_idx ON outbox (aggregateid) WHERE status = 'failed';"
+        in outbox_ddl()
+    )
+
+
 def test_jsonb_variant_changes_only_the_payload_type():
     assert "payload       JSONB" in outbox_ddl(payload="jsonb")
 
@@ -72,8 +79,7 @@ def test_make_outbox_table_matches_the_ddl_columns():
     assert table.c.seq.identity is not None and table.c.seq.identity.always
     assert type(table.c.payload.type).__name__ == "LargeBinary"
     assert type(make_outbox_table(sa.MetaData(), "o", "jsonb").c.payload.type).__name__ == "JSONB"
-    (index,) = table.indexes
-    assert index.name == "outbox_pending_idx"
+    assert {i.name for i in table.indexes} == {"outbox_pending_idx", "outbox_failed_idx"}
 
 
 def test_make_outbox_table_supports_schema_qualified_names():

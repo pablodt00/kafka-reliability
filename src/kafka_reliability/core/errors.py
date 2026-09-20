@@ -43,6 +43,35 @@ class RelayError(KafkaReliabilityError):
     """The outbox relay failed to produce a message to Kafka."""
 
 
+class DedupKeyError(KafkaReliabilityError, ValueError):
+    """A dedup key could not be derived from a record.
+
+    Raised loudly — a record with no usable key is never silently processed or
+    silently skipped, because either would defeat the point of deduplication.
+    """
+
+
+class PermanentError(KafkaReliabilityError):
+    """Raise from a handler to say "retrying cannot help": dead-letter this record.
+
+    `DlqRouter.should_dead_letter` treats it as permanent. The library ships no
+    default policy for other exceptions (04-replay-dlq.md).
+    """
+
+
+class TransientError(KafkaReliabilityError):
+    """Raise from a handler to say "this may succeed later": retry, do not dead-letter."""
+
+
+class UnclassifiedError(KafkaReliabilityError):
+    """An exception was neither `PermanentError` nor `TransientError`.
+
+    Raised by `typed_errors` rather than guessing: whether a bare `ConnectionError`
+    is worth retrying is the handler's knowledge, not the library's. The original
+    exception is chained as `__cause__`.
+    """
+
+
 class MissingExtraError(ConfigurationError, ImportError):
     """A backend's third-party driver is not installed.
 

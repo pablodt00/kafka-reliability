@@ -109,6 +109,10 @@ def outbox_ddl(
         f");"
     )
     statements.append(f"CREATE INDEX {base}_pending_idx ON {table} (seq) WHERE status = 'pending';")
+    # Lets the relay test "does this key have a failed row?" without scanning the table.
+    statements.append(
+        f"CREATE INDEX {base}_failed_idx ON {table} (aggregateid) WHERE status = 'failed';"
+    )
     return "\n".join(statements) + "\n"
 
 
@@ -166,6 +170,11 @@ def make_outbox_table(
             f"{name}_pending_idx",
             "seq",
             postgresql_where=sa.text("status = 'pending'"),
+        ),
+        sa.Index(
+            f"{name}_failed_idx",
+            "aggregateid",
+            postgresql_where=sa.text("status = 'failed'"),
         ),
         schema=schema or None,
     )

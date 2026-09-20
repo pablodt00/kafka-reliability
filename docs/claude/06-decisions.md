@@ -64,7 +64,7 @@ columns prove to actually drift in practice.
 ## D2 — Outbox ordering defaults to strict, with sharding opt-in
 
 **Decided: `ordering="strict"` by default** — one relay elected by a Postgres
-advisory lock, rows walked in `id` order.
+advisory lock, rows walked in `seq` order.
 
 **Trade-off accepted:** throughput is capped at one process. This is a real cost
 and it is bounded: produces are pipelined and acks batched, so a single relay
@@ -457,3 +457,120 @@ against a real broker when this was decided); reusing `RelayError`.
 is a throughput bottleneck or misbehaves on shutdown would justify moving to
 `AIOProducer`; a user need for batching semantics the protocol cannot express
 would justify a `send_batch` — not silently widening `send`.
+
+---
+
+## D15 — Relay implementation: dedicated connection, per-shard advisory locks, one attempt per pass
+
+**Decided:**
+
+- **The relay runs on one dedicated `asyncpg.Connection`** (not a `Pool`),
+  behind a small `RelayStore` protocol. asyncpg is the only relay driver for
+  now (`[outbox-asyncpg]`); the protocol is what lets relay behaviour be tested
+  without a database and leaves room for other drivers.
+- **Leadership is a session-level advisory lock on that same connection**, so
+  losing the connection loses the lock *and* fails the next query. The relay
+  then raises `StoreUnavailableError` and stops rather than continuing unlocked.
+- **Sharded mode takes one advisory lock per `(key, shard_index)`** instead of
+  relying on `FOR UPDATE SKIP LOCKED`. Shards are disjoint by construction, so
+  the only way two relays contend is two relays started with the same
+  `shard_index` — which the per-shard lock prevents. `SKIP LOCKED` would have
+  meant holding a transaction open across every Kafka produce and committing
+  the mark-sent writes only once per batch, growing the duplicate window on a
+  crash from a few rows to the whole batch.
+- **The shard filter is `abs(hashtext(aggregateid)::bigint) % shard_count`.**
+  `hashtext` can return negatives and Postgres `%` keeps the sign, so an
+  un-`abs`ed filter would match no shard for negative-hash keys and stall them.
+- **A `failed` row blocks its key** via `NOT EXISTS` on a new partial index
+  `outbox_failed_idx (aggregateid) WHERE status = 'failed'`. The empty key
+  ("no ordering requirement") is never blocked and each such row is its own
+  ordering unit.
+- **One produce attempt per key per pass.** `attempts`/`last_error` persist
+  across passes and the row goes `failed` at `max_attempts`; `run()` backs off
+  exponentially between failing passes. There is no per-row retry timestamp
+  (it would be another column), so backoff is per relay, not per row.
+- **Mark-sent is one `UPDATE` per key group**, after that group's sends.
+
+**Trade-off accepted:** a transient failure on one key slows the polling cadence
+of all keys (bounded by `max_backoff`); a crash mid-group republishes that
+group's already-acked rows (duplicates, never loss). The DDL gained an index, so
+existing outbox tables need `CREATE INDEX ..._failed_idx`.
+
+**Rejected:** `SKIP LOCKED` with one transaction per batch (above); a pooled
+connection (the lock would belong to whichever session ran the query); an
+in-relay retry loop with sleeps (blocks the whole pass on one bad key).
+
+**Reversed if:** real-Postgres testing (issue #61) shows the per-pass `NOT
+EXISTS` or the three stats queries costing measurably at target scale, or users
+need per-row backoff badly enough to justify a `next_attempt_at` column.
+
+---
+
+## D16 — Dedup API details that refine D4–D6
+
+**Decided:**
+
+- **`claim()` returns a `Claim(result, lease_expired)`**, not a bare `ClaimResult`.
+  D6 requires a distinct metric and log *every time* a lease expires, and only the
+  store can see that the row it took over was an expired `in_progress` one. Redis
+  cannot (an expired key is an absent key), so it never reports it; it still
+  reprocesses.
+- **`process()` yields a `Decision`, not a bool.** It is truthy when the handler
+  should run and carries `commit_offset`, false only for `IN_PROGRESS`. D4 says
+  `IN_PROGRESS` must tell the caller not to commit the offset; a plain bool cannot.
+  Recipes wait and retry the same record rather than skip past it, because
+  committing a *later* offset would lose the skipped message if the lease holder
+  dies.
+- **`mode` defaults to `None`**: `transactional` when `process()` is given a `conn`,
+  `claim_confirm` otherwise. A `conn` against a store that cannot join a
+  transaction **raises**; it never downgrades. `record_after` is explicit only.
+- **`is_done()` exists for `record_after` alone.** It is the one read-then-write in
+  the protocol, racy by design and documented as such.
+- **`purge()` is one method:** `(group, key)` forgets a record (pre-replay);
+  without `key` it sweeps expired rows in chunks. Stores that expire natively
+  return 0 for a sweep.
+- **Transactional mode does not release on exception.** The caller's transaction
+  rollback removes the dedup row; a `DELETE` on an aborted transaction would fail
+  and mask the real error.
+- **Postgres times come from the database clock** (`now()`), never the application's.
+- **The Postgres claim is up to three statements** on the duplicate path (insert,
+  take over if expired, read state) so it can report `lease_expired`; the happy
+  path is one.
+- **Only asyncpg** for the Postgres store; SQLite uses stdlib `sqlite3`, synchronous
+  on the event loop (microsecond statements, single writer).
+
+**Trade-off accepted:** `Claim`/`Decision` are slightly more API than the sketch in
+D4. **Reversed if:** a second driver makes the per-statement claim too slow (fold it
+into one CTE).
+
+---
+
+## D17 — Replay reads through a `Reader` protocol; the CLI's wiring lives in `contrib`
+
+**Decided:**
+
+- **`replay` reads Kafka through a small `Reader` protocol**
+  (`partitions`, `beginning_offsets`, `end_offsets`, `offsets_for_times`, `read`,
+  `commit`) with an aiokafka adapter (`[aiokafka]`) and an `InMemoryReader`. The
+  read side has no delete, no live-group seek and no config call, so D7's "never
+  destroys anything" is structural. `ReplaySelector` takes a `reader`, replacing
+  the `consumer_factory` sketched earlier.
+- **Ranges are half-open `[from, to)`**, and the printed plan
+  (`184100 → 184260 (160 records)`) is reconstructible by offset through
+  `ResolvedSelection.as_selection()`.
+- **`replay/cli.py` is a click command that receives its Kafka clients** as click's
+  `obj` (`Factories`); the aiokafka wiring is `contrib/replay_cli.py`, the console
+  script. The existing boundary test forbids `outbox`/`replay` importing a concrete
+  producer adapter; a composition root in `contrib` honours it instead of
+  weakening it.
+- **The CLI filter is a constrained expression** (`header == 'v' [and ...]`), never
+  `eval`.
+- **Confirmation** above `confirm_above` (10,000) compares the *offset span*
+  (an upper bound) before reading; `--execute` on the CLI additionally runs a dry
+  run and prompts with the real matched count, unless `--yes`.
+- **A malformed `x-dlq-replay-count` is skipped** (`invalid_replay_count`): if the
+  poison guard cannot be evaluated, do not replay.
+
+**Trade-off accepted:** `AiokafkaReader` is verified against fakes only until the
+broker harness (issue #61) exists. **Reversed if:** a second consumer client needs
+first-class support — add it as another `Reader`, not a new code path.

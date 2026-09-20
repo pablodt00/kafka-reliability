@@ -255,6 +255,7 @@ CREATE TABLE outbox (
     last_error    TEXT
 );
 CREATE INDEX outbox_pending_idx ON outbox (seq) WHERE status = 'pending';
+CREATE INDEX outbox_failed_idx  ON outbox (aggregateid) WHERE status = 'failed';  -- relay's "is this key blocked?" check (D15)
 ```
 
 *(`BIGGENERATED ALWAYS AS IDENTITY` above is shorthand for

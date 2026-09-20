@@ -88,11 +88,12 @@ kafka_reliability/
 │   └── errors.py         # exception hierarchy
 ├── outbox/
 │   ├── writer.py         # enqueue into the caller's transaction
-│   ├── relay.py          # poll → produce → mark sent
+│   ├── relay.py          # poll → produce → mark sent; RelayStore protocol
 │   ├── schema.py         # DDL text + SQLAlchemy Table factory
 │   ├── retention.py      # chunked sweep of published rows
 │   └── backends/
 │       ├── asyncpg.py
+│       ├── asyncpg_relay.py # the relay's store (advisory lock, claim, mark)
 │       ├── psycopg.py       # sync + async
 │       ├── sqlalchemy.py    # Core/ORM, sync + async
 │       └── django.py        # atomic() / on_commit() aware
@@ -106,11 +107,14 @@ kafka_reliability/
 │       ├── sqlite.py        # single-node deployments, container-free tests
 │       └── memory.py        # unit tests only; documented as no guarantee
 ├── replay/
+│   ├── reader.py         # Reader protocol + InMemoryReader
+│   ├── reader_aiokafka.py # the shipped Reader adapter
 │   ├── selector.py       # offset / timestamp / predicate selection
+│   ├── expr.py           # constrained header-filter expression (CLI)
 │   ├── runner.py         # dry-run + execute, one code path
 │   ├── dlq.py            # DlqRouter: route a failed message + headers
 │   ├── audit.py          # JSONL audit sink
-│   └── cli.py            # argparse/typer entry point
+│   └── cli.py            # click command; clients injected via Factories
 ├── producers/
 │   ├── port.py           # the Producer protocol
 │   ├── aiokafka.py
@@ -118,7 +122,8 @@ kafka_reliability/
 │   └── memory.py         # public test double
 ├── metrics.py            # MetricsSink protocol; no-op default
 └── contrib/
-    └── otel.py           # optional OpenTelemetry MetricsSink adapter
+    ├── otel.py           # optional OpenTelemetry MetricsSink adapter
+    └── replay_cli.py     # console-script composition root (aiokafka wiring)
 ```
 
 `producers/` is shared by `outbox` and `replay` and is the one place a Kafka
@@ -136,7 +141,8 @@ publisher, a test double) without the library knowing.
 | `outbox.writer` | `core` + the one DB driver its subclass targets — **no Kafka client** |
 | `outbox.relay` | `core`, `producers.port`, DB driver |
 | `dedup` | `core` + its chosen backend driver |
-| `replay` | `core`, `producers.port`, a Kafka **consumer** |
+| `replay` | `core`, `producers.port`, a Kafka **consumer** (`replay.reader_aiokafka` only) — never a concrete producer adapter |
+| `contrib.replay_cli` | anything; the composition root that wires `replay.cli` to aiokafka |
 
 Extras: `[outbox-asyncpg]`, `[outbox-psycopg]`, `[outbox-sqlalchemy]`,
 `[outbox-django]`, `[dedup-postgres]`, `[dedup-redis]`, `[aiokafka]`,
@@ -264,16 +270,24 @@ class RelayConfig:
     ordering: Literal["strict", "sharded"] = "strict"
     shard_count: int = 1
     shard_index: int = 0
-    max_attempts: int = 10
-    advisory_lock_key: int | None = None
+    max_attempts: int = 5
+    advisory_lock_key: int | None = None    # default: hash of the table name
+    retry_backoff: float = 0.5
+    max_backoff: float = 30.0
+    standby_interval: float = 1.0
 
+# The relay reaches the database through a RelayStore protocol; the asyncpg
+# implementation (one dedicated Connection, not a Pool) is
+# outbox/backends/asyncpg_relay.py::AsyncpgRelayStore.
 class OutboxRelay:
-    def __init__(self, *, pool: Any, producer: Producer, table: str = "outbox",
-                 config: RelayConfig = RelayConfig()) -> None: ...
+    def __init__(self, store: RelayStore, producer: Producer,
+                 config: RelayConfig | None = None, *,
+                 metrics: MetricsSink | None = None) -> None: ...
 
-    async def run(self, *, stop: asyncio.Event | None = None) -> None: ...
+    async def run(self, stop: asyncio.Event | None = None) -> None: ...
     async def run_once(self) -> RelayBatchResult: ...   # one pass; for tests and external schedulers
     async def stats(self) -> OutboxStats: ...           # pending count, oldest pending age, failed count
+    async def close(self) -> None: ...                  # release the advisory lock
 ```
 
 ```python
@@ -293,19 +307,26 @@ async def sweep_published(pool: Any, *, older_than: timedelta, chunk: int = 10_0
 ```python
 # kafka_reliability/dedup/store.py
 class ClaimResult(Enum):
-    CLAIMED = auto()        # first time — process it
-    ALREADY_DONE = auto()   # completed before — skip
-    IN_PROGRESS = auto()    # another worker holds a live lease — skip, do not commit offset
+    CLAIMED         # first time (or a previous claim expired) — process it
+    ALREADY_DONE    # completed before — skip
+    IN_PROGRESS     # another worker holds a live lease — skip, do not commit offset
+
+@dataclass(frozen=True)
+class Claim:                    # what claim() returns
+    result: ClaimResult
+    lease_expired: bool = False  # this claim took over an expired in_progress lease (D6)
 
 class DedupStore(Protocol):
     supports_transactions: bool
 
-    async def claim(self, group: str, key: str, *, ttl: timedelta,
-                    lease: timedelta | None = None, conn: Any | None = None) -> ClaimResult: ...
-    async def confirm(self, group: str, key: str, *, conn: Any | None = None) -> None: ...
-    async def release(self, group: str, key: str, *, conn: Any | None = None) -> None: ...
-    async def purge(self, group: str, keys: Iterable[str]) -> int: ...
-```
+    async def claim(self, group: str, key: str, *, state: Literal["in_progress", "done"],
+                    expires_in: timedelta, conn: Any = None) -> Claim: ...
+    async def confirm(self, group: str, key: str, *, expires_in: timedelta, conn: Any = None) -> None: ...
+    async def release(self, group: str, key: str, *, conn: Any = None) -> None: ...
+    async def is_done(self, group: str, key: str, *, conn: Any = None) -> bool: ...  # record_after only
+    async def purge(self, *, group: str | None = None, key: str | None = None,
+                    chunk: int = 10_000, conn: Any = None) -> int: ...
+    # purge(group=, key=) forgets one record; purge() sweeps expired records in chunks.
 
 `claim`, not `seen`. A boolean `seen()` cannot be implemented race-free, and an
 API that invites the race is the wrong API (`03-idempotent-consumer.md`). The
@@ -314,9 +335,9 @@ API that invites the race is the wrong API (`03-idempotent-consumer.md`). The
 and because passing the wrong thing degrades the guarantee rather than silently
 voiding it: `supports_transactions` is checked at construction, so a store that
 cannot use `conn` refuses the strong mode outright instead of ignoring the
-argument. The
-`None` for Redis, and `supports_transactions` lets the `Deduplicator` refuse the
-strong mode rather than degrade silently.
+argument. Redis
+has `supports_transactions = False`, so the `Deduplicator` refuses the strong mode
+rather than degrade silently. See D16 for why `claim` returns a `Claim`.
 
 ```python
 # kafka_reliability/dedup/keys.py
@@ -332,20 +353,30 @@ class Deduplicator:
     def __init__(self, *, store: DedupStore, group: str,
                  key: Callable[[Record], str],          # no default, on purpose
                  ttl: timedelta = timedelta(days=7),
-                 mode: Literal["transactional", "claim_confirm", "record_after"] = "transactional",
+                 mode: Literal["transactional", "claim_confirm", "record_after"] | None = None,
                  lease: timedelta = timedelta(minutes=5),
                  replay_policy: Literal["suppress", "bypass", "namespace"] = "suppress",
-                 on_store_unavailable: Literal["fail_closed", "fail_open"] = "fail_closed") -> None: ...
+                 on_store_unavailable: Literal["fail_closed", "fail_open"] = "fail_closed",
+                 metrics: MetricsSink | None = None) -> None: ...
+    # mode=None: transactional when process() gets a conn, else claim_confirm.
+
+    revocations: RevocationSignals    # assign()/revoke(); one asyncio.Event per assignment
 
     @asynccontextmanager
-    async def process(self, record: Record, *, conn: Any | None = None) -> AsyncIterator[bool]: ...
+    async def process(self, record: Record, *, conn: Any = None) -> AsyncIterator[Decision]: ...
+
+@dataclass(frozen=True)
+class Decision:                 # truthy when the handler should run
+    result: ClaimResult | None  # None: dedup bypassed (replay_policy=bypass, or fail_open)
+    @property
+    def commit_offset(self) -> bool: ...   # False only for IN_PROGRESS
 ```
 
 The context manager is the whole ergonomic bet:
 
 ```python
-async with dedup.process(record, conn=session) as should_process:
-    if should_process:
+async with dedup.process(record, conn=session) as decision:
+    if decision:
         await handle(record, session)
 ```
 
@@ -359,16 +390,31 @@ Celery task, because it knows nothing about any of them.
 # kafka_reliability/replay/dlq.py
 class DlqRouter:
     def __init__(self, *, producer: Producer, topic: str | Callable[[Record], str],
-                 consumer_group: str, include_error_message: bool = True,
-                 max_error_bytes: int = 1024) -> None: ...
+                 consumer_group: str,
+                 classify: Callable[[BaseException], bool],   # required; True = permanent
+                 include_error_message: bool = True,
+                 max_error_bytes: int = 1024, clock: Clock | None = None) -> None: ...
 
+    def should_dead_letter(self, error: BaseException) -> bool: ...
     async def route(self, record: Record, error: BaseException, *, attempts: int = 1) -> None: ...
+
+def typed_errors(error: BaseException) -> bool: ...   # PermanentError -> True, TransientError -> False,
+                                                      # anything else raises UnclassifiedError
 ```
 
 ```python
+# kafka_reliability/replay/reader.py
+class Reader(Protocol):          # the read side; no delete, no live-group seek
+    async def partitions(self, topic) -> Sequence[int]: ...
+    async def beginning_offsets(self, topic, partitions) -> Mapping[int, int]: ...
+    async def end_offsets(self, topic, partitions) -> Mapping[int, int]: ...
+    async def offsets_for_times(self, topic, timestamps_ms) -> Mapping[int, int | None]: ...
+    def read(self, topic, partition, start, end) -> AsyncIterator[Record]: ...   # [start, end)
+    async def commit(self, topic, partition, offset) -> None: ...                 # only if asked
+
 # kafka_reliability/replay/selector.py
 @dataclass(frozen=True)
-class Selection:
+class Selection:                 # ranges are half-open [from, to)
     topic: str
     from_offset: Mapping[int, int] | None = None
     to_offset: Mapping[int, int] | None = None
@@ -379,8 +425,9 @@ class Selection:
     max_messages: int | None = None
 
 class ReplaySelector:
-    def __init__(self, *, consumer_factory: Callable[[], Any]) -> None: ...
+    def __init__(self, *, reader: Reader) -> None: ...
     async def resolve(self, selection: Selection) -> ResolvedSelection: ...   # timestamps → concrete offsets
+# ResolvedSelection.format() prints the plan; .as_selection() reproduces it by offset.
 ```
 
 ```python
@@ -390,9 +437,13 @@ class ReplayPlan:
     replay_id: str
     resolved: ResolvedSelection
     target_topic: str
+    partitions: tuple[PartitionReport, ...]   # scanned / matched per partition
     matched: int
-    skipped: Mapping[str, int]          # reason → count
-    samples: Sequence[Record]
+    skipped: dict[str, int]                   # reason → count
+    oldest: datetime | None; newest: datetime | None
+    samples: tuple[Sample, ...]
+    dry_run: bool
+    def format(self) -> str: ...
 
 @dataclass(frozen=True)
 class ReplayOptions:
@@ -403,10 +454,15 @@ class ReplayOptions:
     preserve_key: bool = True
     commit_source_offsets: bool = False
     audit_path: Path | None = None
+    confirm_above: int = 10_000          # larger runs need confirm= (or assume_yes)
+    assume_yes: bool = False
 
 class ReplayRunner:
     def __init__(self, *, selector: ReplaySelector, producer: Producer,
-                 options: ReplayOptions) -> None: ...
+                 options: ReplayOptions, audit: AuditSink | None = None,
+                 metrics: MetricsSink | None = None, clock: Clock | None = None,
+                 limiter: RateLimiter | None = None,
+                 confirm: Callable[[ResolvedSelection], bool] | None = None) -> None: ...
 
     async def dry_run(self, selection: Selection) -> ReplayPlan: ...
     async def execute(self, selection: Selection) -> ReplayResult: ...

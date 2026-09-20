@@ -250,7 +250,7 @@ old owner may still be running the handler when the new owner receives the same
 message. This is a genuine concurrent duplicate, and it is why the dedup check
 must be an atomic claim (unique constraint / `SET NX`) rather than a read
 followed by a write. A `seen()` boolean API invites the race; the interface
-should therefore be `try_claim(key) -> bool`, not `seen(key) -> bool`. That is an
+should therefore be a claim (`claim(...) -> Claim`), not `seen(key) -> bool`. That is an
 API-shape consequence of a concurrency property, and it is the sort of thing
 that is very hard to retrofit.
 

@@ -1,0 +1,71 @@
+name: Release
+
+# Publishes to PyPI when a version tag is pushed. The full test suite runs first,
+# and the built wheel is installed with no extras to prove `import` still works and
+# the module-boundary rules hold. Requires PyPI trusted publishing for this repo.
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e ".[dev]"
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: mypy src
+      - run: pytest
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Tag matches the package version
+        run: |
+          version=$(python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          test "v$version" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} != version $version"; exit 1; }
+      - run: pip install build
+      - run: python -m build
+      - name: No-extras install imports cleanly and passes the boundary tests
+        run: |
+          python -m venv /tmp/bare
+          /tmp/bare/bin/pip install dist/*.whl
+          /tmp/bare/bin/python -c "import kafka_reliability, kafka_reliability.outbox, kafka_reliability.dedup, kafka_reliability.replay, kafka_reliability.producers, kafka_reliability.contrib"
+          /tmp/bare/bin/pip install pytest pytest-asyncio
+          /tmp/bare/bin/python -m pytest tests/test_import.py tests/test_module_boundaries.py -q
+      - name: Every extra resolves
+        run: |
+          for extra in aiokafka confluent outbox-asyncpg outbox-psycopg outbox-sqlalchemy outbox-django dedup-postgres dedup-redis otel cli; do
+            python -m venv /tmp/e-$extra
+            /tmp/e-$extra/bin/pip install "$(ls dist/*.whl)[$extra]" > /dev/null || { echo "extra $extra failed"; exit 1; }
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
