@@ -1,7 +1,8 @@
 # 00 — Overview
 
-> Status: design context, not a specification. Nothing here has been
-> implemented, and no design decision is left open — see `06-decisions.md`.
+> Status: design context, not a specification. The modules described here are
+> now implemented (see the README status note for what is unverified against real
+> servers), and no design decision is left open — see `06-decisions.md`.
 > Research current as of **2026-09-05**. Version-dependent claims are dated where
 > they appear; see `01-prior-art.md` for the sources behind them.
 

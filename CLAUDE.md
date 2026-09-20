@@ -28,7 +28,7 @@ kafka_reliability/
 ├── replay/          selection, dry-run/execute runner, DlqRouter, JSONL audit, CLI
 ├── producers/       the Producer protocol + aiokafka/confluent/memory adapters
 ├── metrics.py        MetricsSink protocol, no-op default
-└── contrib/         optional integrations (OpenTelemetry adapter) behind extras
+└── contrib/         optional integrations behind extras: OpenTelemetry adapter, replay CLI wiring
 ```
 Full rationale: `docs/claude/05-architecture.md`.
 
@@ -66,8 +66,11 @@ push are separate, later steps the user asks for on their own.
   `.claude/hooks/install-deps.sh`).
 - Fast unit suite: `pytest`
 - Integration suite: `pytest -m integration`. Today that is the outbox
-  write-path conformance suite (`tests/outbox/test_conformance.py`), which needs
-  a Postgres named by `KAFKA_RELIABILITY_TEST_PG_DSN` and skips without it. The
+  write-path conformance suite (`tests/outbox/test_conformance.py`), the relay
+  (`tests/outbox/test_relay_integration.py`) and the dedup stores
+  (`tests/dedup/test_integration.py`), which need a Postgres named by
+  `KAFKA_RELIABILITY_TEST_PG_DSN` (and Redis via
+  `KAFKA_RELIABILITY_TEST_REDIS_URL`) and skip without them. The
   container harness that provides one is tracked in issue #61.
 - Lint: `ruff check .`
 - Format check: `ruff format --check .` (apply fixes locally with `ruff format .`)
